@@ -622,7 +622,7 @@ const App = () => {
                 <div style={{ overflowX: 'auto' }}>
                   <Table>
                     <thead>
-                      <tr style={{ background: '#f3f4f6' }}>
+                      <tr>
                          <Th>指标</Th>
                          {/* Update: Show formatted date with weekday */}
                          {report.dates.map(d => <Th key={d}>{formatDateWithWeekday(d)}</Th>)}
@@ -685,7 +685,7 @@ const App = () => {
                 <div style={{ maxWidth: '600px' }}>
                   <Table>
                     <thead>
-                      <tr style={{ background: '#f3f4f6' }}><Th>指标</Th><Th>数值</Th></tr>
+                      <tr><Th>指标</Th><Th>数值</Th></tr>
                     </thead>
                     <tbody>
                         {report.singleStats && (
@@ -710,7 +710,7 @@ const App = () => {
              <div style={{ overflowX: 'auto' }}>
                <Table>
                  <thead>
-                   <tr style={{ background: '#f3f4f6' }}>
+                   <tr>
                      <Th>策略名称</Th>
                      <Th>命中数</Th>
                      <Th>命中率</Th>
@@ -742,7 +742,7 @@ const App = () => {
              </div>
              <Table>
                <thead>
-                 <tr style={{ background: '#f3f4f6' }}>
+                 <tr>
                    <Th>标签名称</Th>
                    <Th>数量</Th>
                    <Th>违规占比</Th>
@@ -781,19 +781,19 @@ const SectionTitle = ({title}: {title: string}) => (
 );
 
 const Table = ({children}: {children: React.ReactNode}) => (
-  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', border: '1px solid #e5e7eb', whiteSpace: 'nowrap' }}>
+  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', border: '1px solid #e0e0e0', whiteSpace: 'nowrap' }}>
     {children}
   </table>
 );
 
 const Th = ({children}: {children: React.ReactNode}) => (
-  <th style={{ padding: '10px 12px', textAlign: 'center', fontWeight: '600', color: '#374151', borderBottom: '1px solid #e5e7eb', background: '#f9fafb' }}>
+  <th style={{ padding: '10px 12px', textAlign: 'center', fontWeight: '600', color: '#ffffff', borderBottom: '1px solid #3b82f6', background: '#3b82f6' }}>
     {children}
   </th>
 );
 
 const Td = ({children}: {children: React.ReactNode}) => (
-  <td style={{ padding: '10px 12px', borderBottom: '1px solid #f3f4f6', color: '#1f2937', textAlign: 'center' }}>
+  <td style={{ padding: '10px 12px', borderBottom: '1px solid #f0f0f0', color: '#1f2937', textAlign: 'center', borderRight: '1px solid #f0f0f0' }}>
     {children}
   </td>
 );
