@@ -60,6 +60,7 @@ const STRATEGY_MAPPING: Record<string, string> = {
 };
 
 const WEEKLY_KEY = 'ALL_WEEKLY_REPORT';
+const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
 // --- Helper Functions ---
 
@@ -83,6 +84,15 @@ const extractDate = (dateStr: string): string | null => {
     return `${year}-${month}-${day}`;
   }
   return null;
+};
+
+const formatDateWithWeekday = (dateStr: string): string => {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-').map(Number);
+  // Create date object using local time components to avoid timezone shifts
+  const date = new Date(y, m - 1, d);
+  const weekday = WEEKDAYS[date.getDay()];
+  return `${m}.${d} ${weekday}`;
 };
 
 // --- Analysis Core ---
@@ -393,7 +403,9 @@ const App = () => {
     // --- Section 1: Matrix or Single ---
     if (report.mode === 'WEEKLY' && report.dates && report.dailyStatsMap && report.totalStats && report.avgStats) {
        // Matrix Header
-       md += `| 指标 | ${report.dates.join(' | ')} | 总计 | 7天日均 |\n`;
+       // Update: Include weekday in header
+       const dateHeaders = report.dates.map(d => formatDateWithWeekday(d)).join(' | ');
+       md += `| 指标 | ${dateHeaders} | 总计 | 7天日均 |\n`;
        md += `| :--- | ${report.dates.map(() => ':---').join(' | ')} | :--- | :--- |\n`;
        
        // Helper for rows
@@ -612,7 +624,8 @@ const App = () => {
                     <thead>
                       <tr style={{ background: '#f3f4f6' }}>
                          <Th>指标</Th>
-                         {report.dates.map(d => <Th key={d}>{d.slice(5)}</Th>)}
+                         {/* Update: Show formatted date with weekday */}
+                         {report.dates.map(d => <Th key={d}>{formatDateWithWeekday(d)}</Th>)}
                          <Th>总计</Th>
                          <Th>7天日均</Th>
                       </tr>
