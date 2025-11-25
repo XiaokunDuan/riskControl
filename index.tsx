@@ -16,6 +16,38 @@ interface StrategyStats {
   violationCount: number;
 }
 
+interface BasicStats {
+  totalRows: number;
+  machineRejectCount: number;
+  recallCount: number;
+  humanViolationCount: number;
+  blackSampleTotal: number;
+}
+
+interface ReportData {
+  mode: 'SINGLE' | 'WEEKLY';
+  dateLabel: string;
+  
+  // For Single Mode
+  singleStats?: BasicStats;
+  
+  // For Weekly Mode
+  dates?: string[];
+  dailyStatsMap?: Record<string, BasicStats>;
+  totalStats?: BasicStats;
+  avgStats?: Record<string, string>; // Pre-formatted averages
+
+  // Aggregated Strategy & Tags (Used for both modes)
+  strategyList: StrategyStats[];
+  tagList: { name: string; count: number }[];
+  totalTagCount: number;
+  
+  // Context for calculations
+  aggTotalRows: number;
+  aggHumanViolationCount: number;
+  aggRecallCount: number;
+}
+
 // --- Constants & Mappings ---
 
 const STRATEGY_MAPPING: Record<string, string> = {
@@ -23,10 +55,11 @@ const STRATEGY_MAPPING: Record<string, string> = {
   'service_digital_human_check': '数字人物料机审',
   'service_sync_word': '业务线词表策略',
   'qr_code_detect': '二维码图片识别模型',
-  // Common guesses based on report context, though strict mapping relies on CSV keys
   'sensitive_img_model': '敏感图片模型',
   'img_ocr_strategy': '图片ocr策略'
 };
+
+const WEEKLY_KEY = 'ALL_WEEKLY_REPORT';
 
 // --- Helper Functions ---
 
@@ -35,8 +68,13 @@ const formatPercent = (numerator: number, denominator: number, decimals: number 
   return ((numerator / denominator) * 100).toFixed(decimals);
 };
 
+const formatDecimal = (val: number, decimals: number = 2): string => {
+  return val.toFixed(decimals);
+};
+
 const extractDate = (dateStr: string): string | null => {
   if (!dateStr) return null;
+  // Match YYYY/MM/DD or YYYY-MM-DD
   const match = dateStr.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
   if (match) {
     const year = match[1];
@@ -47,6 +85,93 @@ const extractDate = (dateStr: string): string | null => {
   return null;
 };
 
+// --- Analysis Core ---
+
+const analyzeRows = (rows: CsvRow[]) => {
+  let totalRows = rows.length;
+  let machineRejectCount = 0;
+  let recallCount = 0;
+  let humanViolationCount = 0;
+
+  const strategyMap = new Map<string, StrategyStats>();
+  const tagMap = new Map<string, number>();
+
+  rows.forEach(row => {
+    // 1. Basic Stats
+    const isSyncReject = row['同步机审状态']?.trim() === '拒绝';
+    const isAsyncReject = row['异步机审状态']?.trim() === '拒绝';
+    const isMachineReject = isSyncReject || isAsyncReject;
+    if (isMachineReject) machineRejectCount++;
+
+    const humanStatus = row['人审状态']?.trim();
+    const isHumanSent = !!humanStatus; // Not empty -> Sent to human (Recall)
+    const isHumanViolation = humanStatus === '拒绝';
+    const isHumanPending = humanStatus === '待审';
+
+    if (isHumanSent) recallCount++;
+    if (isHumanViolation) humanViolationCount++;
+
+    // 2. Strategy Stats
+    let rawStrategyValue = row['同步机审命中策略']?.trim();
+    if (!rawStrategyValue) {
+      rawStrategyValue = row['异步机审命中策略']?.trim();
+    }
+
+    if (rawStrategyValue) {
+      const splitName = rawStrategyValue.split('&&')[0].trim();
+      const strategyName = STRATEGY_MAPPING[splitName] || splitName;
+
+      if (!strategyMap.has(strategyName)) {
+        strategyMap.set(strategyName, {
+          name: strategyName,
+          hitCount: 0,
+          humanReviewCount: 0,
+          pendingCount: 0,
+          violationCount: 0
+        });
+      }
+
+      const stats = strategyMap.get(strategyName)!;
+      stats.hitCount++;
+      if (isHumanSent) stats.humanReviewCount++;
+      if (isHumanPending) stats.pendingCount++;
+      if (isHumanViolation) stats.violationCount++;
+    }
+
+    // 3. Tag Stats (Only for violations)
+    if (isHumanViolation) {
+      const rawTags = String(row['人审标签'] || '');
+      const tokens = rawTags.split('&&');
+      tokens.forEach(token => {
+        const tag = token.trim();
+        const isInvalid = !tag ||
+          tag === '通过' ||
+          tag === '拒绝' ||
+          tag === '待审' ||
+          tag === '送审';
+
+        if (!isInvalid) {
+          tagMap.set(tag, (tagMap.get(tag) || 0) + 1);
+        }
+      });
+    }
+  });
+
+  // 4. Black Sample Logic: Recall + Violation
+  const blackSampleTotal = recallCount + humanViolationCount;
+
+  return {
+    totalRows,
+    machineRejectCount,
+    recallCount,
+    humanViolationCount,
+    blackSampleTotal,
+    strategyMap,
+    tagMap
+  };
+};
+
+
 // --- Main Application ---
 
 const App = () => {
@@ -54,10 +179,10 @@ const App = () => {
   const [encoding, setEncoding] = useState<string>('UTF-8');
   const [rawData, setRawData] = useState<CsvRow[]>([]);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
-  const [selectedDate, setSelectedDate] = useState<string>('');
+  const [selectedDate, setSelectedDate] = useState<string>(WEEKLY_KEY);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false); // UI Feedback
+  const [copied, setCopied] = useState(false);
 
   // --- Data Loading ---
 
@@ -67,7 +192,7 @@ const App = () => {
       setError(null);
       setRawData([]);
       setAvailableDates([]);
-      setSelectedDate('');
+      setSelectedDate(WEEKLY_KEY);
       setCopied(false);
     }
   };
@@ -90,25 +215,21 @@ const App = () => {
           return;
         }
 
-        // Basic validation
         const firstRow = data[0];
         if (!firstRow['入审时间'] && !firstRow['同步机审状态']) {
-           setError("警告：关键列未找到，请检查 CSV 编码是否正确 (建议尝试 GBK)");
+          setError("警告：关键列未找到，请检查 CSV 编码是否正确 (建议尝试 GBK)");
         }
 
         setRawData(data);
-        
+
         const dates = new Set<string>();
         data.forEach(row => {
           const d = extractDate(row['入审时间']);
           if (d) dates.add(d);
         });
-        
-        const sortedDates = Array.from(dates).sort().reverse();
+
+        const sortedDates = Array.from(dates).sort(); // Sort ASC for columns
         setAvailableDates(sortedDates);
-        if (sortedDates.length > 0) {
-          setSelectedDate(sortedDates[0]);
-        }
         setLoading(false);
       },
       error: (err: any) => {
@@ -118,114 +239,146 @@ const App = () => {
     });
   };
 
-  // --- Analysis Logic ---
+  // --- Report Generation Logic ---
 
-  const report = useMemo(() => {
-    if (!selectedDate || rawData.length === 0) return null;
+  const report = useMemo<ReportData | null>(() => {
+    if (rawData.length === 0) return null;
 
-    const dailyData = rawData.filter(row => extractDate(row['入审时间']) === selectedDate);
-    const totalRows = dailyData.length;
-
-    let machineRejectCount = 0;
-    let recallCount = 0; 
-    let humanViolationCount = 0;
-    
-    const strategyMap = new Map<string, StrategyStats>();
-    const tagMap = new Map<string, number>();
-
-    dailyData.forEach(row => {
-      // 1. Basic Stats
-      const isSyncReject = row['同步机审状态']?.trim() === '拒绝';
-      const isAsyncReject = row['异步机审状态']?.trim() === '拒绝';
-      const isMachineReject = isSyncReject || isAsyncReject;
-      if (isMachineReject) machineRejectCount++;
-
-      const humanStatus = row['人审状态']?.trim();
-      const isHumanSent = !!humanStatus; // Not empty -> Sent to human (Recall)
-      const isHumanViolation = humanStatus === '拒绝';
-      const isHumanPending = humanStatus === '待审';
-
-      if (isHumanSent) recallCount++;
-      if (isHumanViolation) humanViolationCount++;
-
-      // 2. Strategy Stats
-      let rawStrategyValue = row['同步机审命中策略']?.trim();
-      if (!rawStrategyValue) {
-        rawStrategyValue = row['异步机审命中策略']?.trim();
-      }
+    // --- Mode 1: Weekly/Overall ---
+    if (selectedDate === WEEKLY_KEY) {
+      const dates = availableDates; // Already sorted ASC
+      const dailyStatsMap: Record<string, BasicStats> = {};
       
-      if (rawStrategyValue) {
-        // Logic: Split by && and take first
-        const splitName = rawStrategyValue.split('&&')[0].trim();
-        // Logic: Map to Chinese
-        const strategyName = STRATEGY_MAPPING[splitName] || splitName;
-        
-        if (!strategyMap.has(strategyName)) {
-          strategyMap.set(strategyName, {
-            name: strategyName,
-            hitCount: 0,
-            humanReviewCount: 0,
-            pendingCount: 0,
-            violationCount: 0
-          });
-        }
-        
-        const stats = strategyMap.get(strategyName)!;
-        stats.hitCount++;
-        if (isHumanSent) stats.humanReviewCount++;
-        if (isHumanPending) stats.pendingCount++;
-        if (isHumanViolation) stats.violationCount++;
-      }
+      // Accumulators for aggregation
+      let aggTotalRows = 0;
+      let aggMachineReject = 0;
+      let aggRecall = 0;
+      let aggHumanViolation = 0;
+      let aggBlackSample = 0;
+      
+      // Rates accumulation for averaging
+      let sumRecallRate = 0;
+      let sumPrecision = 0;
+      let sumRiskLevel = 0;
 
-      // 3. Tag Stats (Only for violations)
-      if (isHumanViolation) {
-        const rawTags = String(row['人审标签'] || '');
-        
-        // 【修正】新逻辑：按 && 分割，并过滤掉状态词
-        const tokens = rawTags.split('&&');
-        tokens.forEach(token => {
-            const tag = token.trim();
-            // 过滤无效词：空值、通过、拒绝、待审、送审
-            const isInvalid = !tag || 
-                              tag === '通过' || 
-                              tag === '拒绝' || 
-                              tag === '待审' || 
-                              tag === '送审'; 
-            
-            if (!isInvalid) {
-                tagMap.set(tag, (tagMap.get(tag) || 0) + 1);
-            }
+      const aggStrategyMap = new Map<string, StrategyStats>();
+      const aggTagMap = new Map<string, number>();
+
+      dates.forEach(d => {
+        const dayRows = rawData.filter(r => extractDate(r['入审时间']) === d);
+        const stats = analyzeRows(dayRows);
+        dailyStatsMap[d] = stats;
+
+        // Sum Totals
+        aggTotalRows += stats.totalRows;
+        aggMachineReject += stats.machineRejectCount;
+        aggRecall += stats.recallCount;
+        aggHumanViolation += stats.humanViolationCount;
+        aggBlackSample += stats.blackSampleTotal;
+
+        // Sum Rates (for simple average calc)
+        // Rate = (num / den) * 100
+        const recallRate = stats.totalRows > 0 ? (stats.recallCount / stats.totalRows) * 100 : 0;
+        const precision = stats.recallCount > 0 ? (stats.humanViolationCount / stats.recallCount) * 100 : 0;
+        const risk = stats.totalRows > 0 ? (stats.blackSampleTotal / stats.totalRows) * 100 : 0;
+
+        sumRecallRate += recallRate;
+        sumPrecision += precision;
+        sumRiskLevel += risk;
+
+        // Aggregate Strategies
+        stats.strategyMap.forEach((val, key) => {
+           const exist = aggStrategyMap.get(key);
+           if (!exist) {
+             aggStrategyMap.set(key, { ...val });
+           } else {
+             exist.hitCount += val.hitCount;
+             exist.humanReviewCount += val.humanReviewCount;
+             exist.pendingCount += val.pendingCount;
+             exist.violationCount += val.violationCount;
+           }
         });
-      }
-    });
 
-    // 4. Final Aggregates
-    // 【修改】回归历史逻辑：黑样本 = 策略召回量级 + 人审违规量级
-    // (例如 11.17: 463 + 173 = 636)
-    const blackSampleTotal = recallCount + humanViolationCount;
-    
-    const strategyList = Array.from(strategyMap.values()).sort((a, b) => b.hitCount - a.hitCount);
+        // Aggregate Tags
+        stats.tagMap.forEach((count, tag) => {
+           aggTagMap.set(tag, (aggTagMap.get(tag) || 0) + count);
+        });
+      });
 
-    const tagList = Array.from(tagMap.entries())
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 15); // Extended to top 15 to match example depth if needed
+      // Prepare Total Stats (Summed)
+      const totalStats: BasicStats = {
+        totalRows: aggTotalRows,
+        machineRejectCount: aggMachineReject,
+        recallCount: aggRecall,
+        humanViolationCount: aggHumanViolation,
+        blackSampleTotal: aggBlackSample
+      };
 
-    // Tag Summary
-    const totalTagCount = tagList.reduce((acc, curr) => acc + curr.count, 0);
+      // Prepare Average Stats (Simple Average over days)
+      const dayCount = dates.length || 1;
+      const avgStats = {
+        totalRows: formatDecimal(aggTotalRows / dayCount, 2),
+        machineRejectCount: formatDecimal(aggMachineReject / dayCount, 3), // Example had 3 decimals
+        recallCount: formatDecimal(aggRecall / dayCount, 2),
+        humanViolationCount: formatDecimal(aggHumanViolation / dayCount, 2),
+        blackSampleTotal: formatDecimal(aggBlackSample / dayCount, 0), // Usually int, example 600
+        
+        // Rate Averages
+        recallRate: formatDecimal(sumRecallRate / dayCount, 2) + '%',
+        precision: formatDecimal(sumPrecision / dayCount, 2) + '%',
+        riskLevel: formatDecimal(sumRiskLevel / dayCount, 2) + '%'
+      };
 
-    return {
-      date: selectedDate,
-      totalRows,
-      machineRejectCount,
-      recallCount,
-      humanViolationCount,
-      blackSampleTotal,
-      strategyList,
-      tagList,
-      totalTagCount
-    };
-  }, [rawData, selectedDate]);
+      // Sort Lists
+      const strategyList = Array.from(aggStrategyMap.values()).sort((a, b) => b.hitCount - a.hitCount);
+      const tagList = Array.from(aggTagMap.entries())
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 35);
+      const totalTagCount = tagList.reduce((acc, curr) => acc + curr.count, 0);
+
+      return {
+        mode: 'WEEKLY',
+        dateLabel: '整体周报',
+        dates,
+        dailyStatsMap,
+        totalStats,
+        avgStats,
+        strategyList,
+        tagList,
+        totalTagCount,
+        aggTotalRows,
+        aggHumanViolationCount: aggHumanViolation,
+        aggRecallCount: aggRecall
+      };
+
+    } 
+    // --- Mode 2: Single Day ---
+    else {
+      const dayRows = rawData.filter(r => extractDate(r['入审时间']) === selectedDate);
+      const stats = analyzeRows(dayRows);
+      
+      const strategyList = Array.from(stats.strategyMap.values()).sort((a, b) => b.hitCount - a.hitCount);
+      const tagList = Array.from(stats.tagMap.entries())
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 35);
+      const totalTagCount = tagList.reduce((acc, curr) => acc + curr.count, 0);
+
+      return {
+        mode: 'SINGLE',
+        dateLabel: selectedDate,
+        singleStats: stats,
+        strategyList,
+        tagList,
+        totalTagCount,
+        aggTotalRows: stats.totalRows,
+        aggHumanViolationCount: stats.humanViolationCount,
+        aggRecallCount: stats.recallCount
+      };
+    }
+
+  }, [rawData, selectedDate, availableDates]);
 
 
   // --- Generate Markdown ---
@@ -233,65 +386,117 @@ const App = () => {
   const generateMarkdown = () => {
     if (!report) return '';
 
-    const {
-        date, totalRows, machineRejectCount, recallCount, humanViolationCount,
-        blackSampleTotal, strategyList, tagList, totalTagCount
-    } = report;
-
-    // Precision Rules from Example:
-    // Section 1: 2 decimals
-    const recallRate = formatPercent(recallCount, totalRows, 2);
-    const strategyPrecision = formatPercent(humanViolationCount, recallCount, 2);
-    const riskLevel = formatPercent(blackSampleTotal, totalRows, 2);
-
     let md = `### 一、基本统计分析工作\n`;
-    md += `**[${date}] 大盘情况**\n\n`;
-    md += `| 指标 | 数值 | 备注 |\n| :--- | :--- | :--- |\n`;
-    md += `| **送审量级** | ${totalRows} | |\n`;
-    md += `| **机审拒绝** | ${machineRejectCount} | |\n`;
-    md += `| **策略召回量级（送人审）** | ${recallCount} | |\n`;
-    md += `| **策略总命中率** | ${recallRate}% | |\n`;
-    md += `| **人审判定违规量级** | ${humanViolationCount} | |\n`;
-    md += `| **策略总精确率** | ${strategyPrecision}% | |\n`;
-    md += `| **黑样本总数** | ${blackSampleTotal} | 机审拒绝+人审违规 |\n`;
-    md += `| **大盘风险水位** | ${riskLevel}% | |\n\n`;
+    md += `**[${report.dateLabel}] 大盘情况**\n`;
+    md += `包括但不限于送审量级、策略召回量级、违规量级、大盘风险水位（违规量级/送审量级）等\n\n`;
 
+    // --- Section 1: Matrix or Single ---
+    if (report.mode === 'WEEKLY' && report.dates && report.dailyStatsMap && report.totalStats && report.avgStats) {
+       // Matrix Header
+       md += `| 指标 | ${report.dates.join(' | ')} | 总计 | 7天日均 |\n`;
+       md += `| :--- | ${report.dates.map(() => ':---').join(' | ')} | :--- | :--- |\n`;
+       
+       // Helper for rows
+       const renderRow = (label: string, key: keyof BasicStats, isPercent: boolean = false, denomKey?: keyof BasicStats) => {
+         let rowStr = `| **${label}** |`;
+         // Days
+         report.dates!.forEach(d => {
+            const s = report.dailyStatsMap![d];
+            const val = s[key];
+            if (isPercent && denomKey) {
+                rowStr += ` ${formatPercent(val, s[denomKey], 2)}% |`;
+            } else {
+                rowStr += ` ${val} |`;
+            }
+         });
+         // Total
+         const totalVal = report.totalStats![key];
+         if (isPercent && denomKey) {
+             // Total Rate = Total Num / Total Denom
+             rowStr += ` ${formatPercent(totalVal, report.totalStats![denomKey], 2)}% |`;
+         } else {
+             rowStr += ` ${totalVal} |`;
+         }
+         // Avg
+         // Map keys to avgStats keys
+         let avgVal = '';
+         if (label === '送审量级') avgVal = report.avgStats!.totalRows;
+         else if (label === '机审拒绝') avgVal = report.avgStats!.machineRejectCount;
+         else if (label === '策略召回量级（送人审）') avgVal = report.avgStats!.recallCount;
+         else if (label === '策略总命中率') avgVal = report.avgStats!.recallRate;
+         else if (label === '人审判定违规量级') avgVal = report.avgStats!.humanViolationCount;
+         else if (label === '策略总精确率') avgVal = report.avgStats!.precision;
+         else if (label === '黑样本总数') avgVal = report.avgStats!.blackSampleTotal;
+         else if (label === '大盘风险水位') avgVal = report.avgStats!.riskLevel;
+
+         rowStr += ` ${avgVal} |\n`;
+         return rowStr;
+       };
+
+       md += renderRow('送审量级', 'totalRows');
+       md += renderRow('机审拒绝', 'machineRejectCount');
+       md += renderRow('策略召回量级（送人审）', 'recallCount');
+       md += renderRow('策略总命中率', 'recallCount', true, 'totalRows');
+       md += renderRow('人审判定违规量级', 'humanViolationCount');
+       md += renderRow('策略总精确率', 'humanViolationCount', true, 'recallCount');
+       md += renderRow('黑样本总数', 'blackSampleTotal');
+       md += renderRow('大盘风险水位', 'blackSampleTotal', true, 'totalRows');
+       md += '\n';
+
+    } else if (report.mode === 'SINGLE' && report.singleStats) {
+       // Original Single Column View
+       const s = report.singleStats;
+       const recallRate = formatPercent(s.recallCount, s.totalRows, 2);
+       const strategyPrecision = formatPercent(s.humanViolationCount, s.recallCount, 2);
+       const riskLevel = formatPercent(s.blackSampleTotal, s.totalRows, 2);
+
+       md += `| 指标 | 数值 | 备注 |\n| :--- | :--- | :--- |\n`;
+       md += `| **送审量级** | ${s.totalRows} | |\n`;
+       md += `| **机审拒绝** | ${s.machineRejectCount} | |\n`;
+       md += `| **策略召回量级（送人审）** | ${s.recallCount} | |\n`;
+       md += `| **策略总命中率** | ${recallRate}% | |\n`;
+       md += `| **人审判定违规量级** | ${s.humanViolationCount} | |\n`;
+       md += `| **策略总精确率** | ${strategyPrecision}% | |\n`;
+       md += `| **黑样本总数** | ${s.blackSampleTotal} | 策略召回+人审违规 |\n`;
+       md += `| **大盘风险水位** | ${riskLevel}% | |\n\n`;
+    }
+
+    // --- Section 2: Strategies ---
     md += `### 二、策略情况\n`;
     md += `*(策略召回量级/送审量级)、策略精确率（违规量级/策略召回量级）*\n\n`;
     md += `| 策略名称 | 策略命中数量 | 策略命中率 | 送人审(含待审) | 策略下违规数量 | 策略精确率 |\n`;
     md += `| :--- | :--- | :--- | :--- | :--- | :--- |\n`;
 
-    strategyList.forEach(s => {
-        // Precision Rule: Hit Rate 4 decimals
-        const hitRate = formatPercent(s.hitCount, totalRows, 4);
-        // Precision Rule: Precision 2 decimals
-        const precision = formatPercent(s.violationCount, s.humanReviewCount, 2);
-        
-        md += `| ${s.name} | ${s.hitCount} | ${hitRate}% | ${s.humanReviewCount}<br>(待审：${s.pendingCount}) | ${s.violationCount} | ${precision}% |\n`;
+    report.strategyList.forEach(s => {
+      const hitRate = formatPercent(s.hitCount, report.aggTotalRows, 4);
+      const precision = formatPercent(s.violationCount, s.humanReviewCount, 2);
+      md += `| ${s.name} | ${s.hitCount} | ${hitRate}% | ${s.humanReviewCount}<br>(待审：${s.pendingCount}) | ${s.violationCount} | ${precision}% |\n`;
     });
     md += `\n`;
 
+    // --- Section 3: Tags ---
     md += `### 三、大盘风险分布\n`;
     md += `*(by标签统计量级、违规标签占比：违规标签a/总违规量级、违规标签风险水位：违规标签a/送审量级)*\n`;
-    md += `*   人审违规数量：${humanViolationCount}\n`;
-    md += `*   机审拒绝+人审违规数量：${blackSampleTotal}\n\n`;
+    md += `*   人审违规数量：${report.aggHumanViolationCount}\n`;
+    // For Weekly, this sums up black samples. For Single, it's black samples.
+    // Logic: Black Sample = Recall + Human Violation. 
+    // report.totalStats?.blackSampleTotal or report.singleStats?.blackSampleTotal
+    const blackTotal = report.mode === 'WEEKLY' ? report.totalStats!.blackSampleTotal : report.singleStats!.blackSampleTotal;
+    md += `*   机审拒绝+人审违规数量 (实际上是策略召回+人审违规)：${blackTotal}\n\n`;
+    
     md += `| 人审标签 | 数量 | 违规标签占比 | 风险水位 |\n`;
     md += `| :--- | :--- | :--- | :--- |\n`;
 
     let totalRiskSum = 0;
-
-    tagList.forEach(t => {
-        // Precision Rule: Share & Risk 4 decimals
-        const share = formatPercent(t.count, humanViolationCount, 4);
-        const riskVal = (t.count / totalRows) * 100;
-        totalRiskSum += riskVal;
-        const risk = riskVal.toFixed(4);
-        
-        md += `| ${t.name} | ${t.count} | ${share}% | ${risk}% |\n`;
+    report.tagList.forEach(t => {
+      const share = formatPercent(t.count, report.aggHumanViolationCount, 4);
+      const riskVal = (t.count / report.aggTotalRows) * 100;
+      totalRiskSum += riskVal;
+      const risk = riskVal.toFixed(4);
+      md += `| ${t.name} | ${t.count} | ${share}% | ${risk}% |\n`;
     });
-
-    // Summary Row
-    md += `| **汇总** | **${totalTagCount}** | **100.00%** | **${totalRiskSum.toFixed(4)}%** |`;
+    
+    md += `| **汇总** | **${report.totalTagCount}** | **100.00%** | **${totalRiskSum.toFixed(4)}%** |`;
 
     return md;
   };
@@ -308,11 +513,10 @@ const App = () => {
   // --- Render ---
 
   return (
-    <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '20px', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
+    <div style={{ maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
       
       <header style={{ marginBottom: '30px', borderBottom: '1px solid #e5e7eb', paddingBottom: '20px' }}>
         <h1 style={{ margin: 0, color: '#111827', fontSize: '24px' }}>慧播星风控周报生成器</h1>
-        <p style={{ color: '#6b7280', margin: '8px 0 0 0' }}>Data Analyst Dashboard</p>
       </header>
 
       {/* Controls */}
@@ -320,19 +524,19 @@ const App = () => {
         <div style={{ display: 'flex', gap: '24px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
           
           <div>
-            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '600', fontSize: '14px', color: '#374151' }}>1. 文件编码 (Encoding)</label>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '600', fontSize: '14px', color: '#374151' }}>1. 文件编码</label>
             <select 
               value={encoding} 
               onChange={(e) => setEncoding(e.target.value)}
-              style={{ padding: '8px 12px', borderRadius: '6px', border: '1px solid #d1d5db', width: '100%', backgroundColor: '#f9fafb' }}
+              style={{ padding: '8px 12px', borderRadius: '6px', border: '1px solid #d1d5db', backgroundColor: '#f9fafb' }}
             >
-              <option value="UTF-8">UTF-8 (标准)</option>
-              <option value="GBK">GBK (中文CSV推荐)</option>
+              <option value="UTF-8">UTF-8</option>
+              <option value="GBK">GBK</option>
             </select>
           </div>
 
           <div style={{ flex: 1, minWidth: '200px' }}>
-            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '600', fontSize: '14px', color: '#374151' }}>2. 上传 CSV 数据</label>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '600', fontSize: '14px', color: '#374151' }}>2. 上传 CSV</label>
             <input 
               type="file" 
               accept=".csv" 
@@ -351,9 +555,7 @@ const App = () => {
                  color: 'white', 
                  border: 'none', 
                  borderRadius: '6px', 
-                 cursor: (!file || loading) ? 'not-allowed' : 'pointer',
-                 fontWeight: '500',
-                 transition: 'background 0.2s'
+                 cursor: (!file || loading) ? 'not-allowed' : 'pointer'
                }}
              >
                {loading ? '分析中...' : '开始分析'}
@@ -361,186 +563,224 @@ const App = () => {
           </div>
         </div>
 
+        {availableDates.length > 0 && (
+          <div style={{ marginTop: '20px', borderTop: '1px solid #e5e7eb', paddingTop: '20px' }}>
+             <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', color: '#059669' }}>3. 选择统计模式</label>
+             <select 
+                value={selectedDate} 
+                onChange={(e) => setSelectedDate(e.target.value)}
+                style={{ padding: '8px 12px', borderRadius: '6px', border: '2px solid #059669', minWidth: '300px', fontSize: '16px', fontWeight: '500', color: '#064e3b' }}
+             >
+                <option value={WEEKLY_KEY}>📊 整体周报 (汇总 + 每日明细)</option>
+                <optgroup label="单日视图">
+                  {availableDates.map(d => <option key={d} value={d}>{d}</option>)}
+                </optgroup>
+             </select>
+          </div>
+        )}
+        
         {error && (
           <div style={{ marginTop: '16px', color: '#991b1b', background: '#fef2f2', padding: '12px', borderRadius: '6px', border: '1px solid #fecaca', fontSize: '14px' }}>
             🚨 {error}
           </div>
         )}
-
-        {availableDates.length > 0 && (
-          <div style={{ marginTop: '20px', borderTop: '1px solid #e5e7eb', paddingTop: '20px' }}>
-             <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', color: '#059669' }}>3. 选择统计日期</label>
-             <select 
-                value={selectedDate} 
-                onChange={(e) => setSelectedDate(e.target.value)}
-                style={{ padding: '8px 12px', borderRadius: '6px', border: '2px solid #059669', minWidth: '240px', fontSize: '16px', fontWeight: '500' }}
-             >
-                {availableDates.map(d => <option key={d} value={d}>{d}</option>)}
-             </select>
-          </div>
-        )}
       </div>
 
-      {/* Report Display */}
+      {/* Report View */}
       {report && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.2fr) minmax(0, 0.8fr)', gap: '24px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '24px' }}>
           
-          {/* Visual Table */}
           <div style={{ background: '#fff', padding: '24px', borderRadius: '12px', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' }}>
-            <h2 style={{ fontSize: '18px', fontWeight: '700', color: '#1f2937', marginTop: 0, paddingBottom: '12px', borderBottom: '2px solid #3b82f6' }}>
-              📊 报表预览 ({selectedDate})
-            </h2>
-            
-            <SectionTitle title="一、大盘情况" />
-            <Table>
+             {/* Header Section */}
+             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', borderBottom: '2px solid #3b82f6', paddingBottom: '12px' }}>
+                <h2 style={{ fontSize: '18px', fontWeight: '700', color: '#1f2937', margin: 0 }}>
+                  {report.mode === 'WEEKLY' ? '📊 整体周报概览' : `📅 单日报表 (${report.dateLabel})`}
+                </h2>
+                <button 
+                  onClick={handleCopy}
+                  style={{ background: copied ? '#10b981' : '#3b82f6', color: 'white', border: 'none', padding: '6px 16px', borderRadius: '6px', cursor: 'pointer', fontSize: '14px', fontWeight: '500' }}
+                >
+                  {copied ? '✓ 已复制 Markdown' : '复制 Markdown'}
+                </button>
+             </div>
+
+             {/* 1. General Stats Table (Matrix or Single) */}
+             <SectionTitle title="一、大盘情况" />
+             {report.mode === 'WEEKLY' && report.dates && report.totalStats ? (
+                <div style={{ overflowX: 'auto' }}>
+                  <Table>
+                    <thead>
+                      <tr style={{ background: '#f3f4f6' }}>
+                         <Th>指标</Th>
+                         {report.dates.map(d => <Th key={d}>{d.slice(5)}</Th>)}
+                         <Th>总计</Th>
+                         <Th>7天日均</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {/* Rows helper */}
+                      {[
+                        { label: '送审量级', key: 'totalRows' },
+                        { label: '机审拒绝', key: 'machineRejectCount' },
+                        { label: '策略召回量级（送人审）', key: 'recallCount' },
+                        { label: '策略总命中率', key: 'recallCount', denom: 'totalRows' },
+                        { label: '人审判定违规量级', key: 'humanViolationCount' },
+                        { label: '策略总精确率', key: 'humanViolationCount', denom: 'recallCount' },
+                        { label: '黑样本总数', key: 'blackSampleTotal' },
+                        { label: '大盘风险水位', key: 'blackSampleTotal', denom: 'totalRows' },
+                      ].map((item, i) => (
+                        <tr key={i} style={item.label.includes('黑样本') || item.label.includes('风险') ? {background: '#fff1f2'} : {}}>
+                          <Td><strong>{item.label}</strong></Td>
+                          {report.dates!.map(d => {
+                             const s = report.dailyStatsMap![d];
+                             // @ts-ignore
+                             const val = s[item.key];
+                             if (item.denom) {
+                               // @ts-ignore
+                               return <Td key={d}>{formatPercent(val, s[item.denom], 2)}%</Td>;
+                             }
+                             return <Td key={d}>{val}</Td>;
+                          })}
+                          {/* Total Column */}
+                          <Td>
+                             {item.denom 
+                                // @ts-ignore
+                                ? `${formatPercent(report.totalStats[item.key], report.totalStats[item.denom], 2)}%`
+                                // @ts-ignore
+                                : report.totalStats[item.key]
+                             }
+                          </Td>
+                          {/* Avg Column */}
+                          <Td>
+                             {/* Map to pre-calculated avgStats */}
+                             { item.label === '送审量级' && report.avgStats!.totalRows }
+                             { item.label === '机审拒绝' && report.avgStats!.machineRejectCount }
+                             { item.label === '策略召回量级（送人审）' && report.avgStats!.recallCount }
+                             { item.label === '策略总命中率' && report.avgStats!.recallRate }
+                             { item.label === '人审判定违规量级' && report.avgStats!.humanViolationCount }
+                             { item.label === '策略总精确率' && report.avgStats!.precision }
+                             { item.label === '黑样本总数' && report.avgStats!.blackSampleTotal }
+                             { item.label === '大盘风险水位' && report.avgStats!.riskLevel }
+                          </Td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </Table>
+                </div>
+             ) : (
+                // Single View Table
+                <div style={{ maxWidth: '600px' }}>
+                  <Table>
+                    <thead>
+                      <tr style={{ background: '#f3f4f6' }}><Th>指标</Th><Th>数值</Th></tr>
+                    </thead>
+                    <tbody>
+                        {report.singleStats && (
+                          <>
+                            <tr><Td>送审量级</Td><Td>{report.singleStats.totalRows}</Td></tr>
+                            <tr><Td>机审拒绝</Td><Td>{report.singleStats.machineRejectCount}</Td></tr>
+                            <tr><Td>策略召回量级</Td><Td>{report.singleStats.recallCount}</Td></tr>
+                            <tr><Td>策略总命中率</Td><Td>{formatPercent(report.singleStats.recallCount, report.singleStats.totalRows, 2)}%</Td></tr>
+                            <tr><Td>人审判定违规</Td><Td>{report.singleStats.humanViolationCount}</Td></tr>
+                            <tr><Td>策略总精确率</Td><Td>{formatPercent(report.singleStats.humanViolationCount, report.singleStats.recallCount, 2)}%</Td></tr>
+                            <tr style={{background:'#fff1f2'}}><Td>黑样本总数</Td><Td>{report.singleStats.blackSampleTotal}</Td></tr>
+                            <tr style={{background:'#fff1f2'}}><Td>大盘风险水位</Td><Td>{formatPercent(report.singleStats.blackSampleTotal, report.singleStats.totalRows, 2)}%</Td></tr>
+                          </>
+                        )}
+                    </tbody>
+                  </Table>
+                </div>
+             )}
+
+             {/* 2. Strategies */}
+             <SectionTitle title="二、策略情况" />
+             <div style={{ overflowX: 'auto' }}>
+               <Table>
+                 <thead>
+                   <tr style={{ background: '#f3f4f6' }}>
+                     <Th>策略名称</Th>
+                     <Th>命中数</Th>
+                     <Th>命中率</Th>
+                     <Th>送人审</Th>
+                     <Th>违规数</Th>
+                     <Th>精确率</Th>
+                   </tr>
+                 </thead>
+                 <tbody>
+                   {report.strategyList.map((s, i) => (
+                     <tr key={i}>
+                       <Td>{s.name}</Td>
+                       <Td>{s.hitCount}</Td>
+                       <Td>{formatPercent(s.hitCount, report.aggTotalRows, 4)}%</Td>
+                       <Td>{s.humanReviewCount} <span style={{fontSize:'0.85em', color:'#6b7280'}}>(待审：{s.pendingCount})</span></Td>
+                       <Td>{s.violationCount}</Td>
+                       <Td>{formatPercent(s.violationCount, s.humanReviewCount, 2)}%</Td>
+                     </tr>
+                   ))}
+                 </tbody>
+               </Table>
+             </div>
+
+             {/* 3. Tags */}
+             <SectionTitle title="三、违规标签分布 (Top 35)" />
+             <div style={{ marginBottom: '10px', fontSize: '13px', color: '#374151' }}>
+                <div>• 人审违规数量：{report.aggHumanViolationCount}</div>
+                <div>• 机审拒绝+人审违规数量：{report.mode === 'WEEKLY' ? report.totalStats?.blackSampleTotal : report.singleStats?.blackSampleTotal}</div>
+             </div>
+             <Table>
                <thead>
                  <tr style={{ background: '#f3f4f6' }}>
-                   <Th>指标</Th><Th>数值</Th>
+                   <Th>标签名称</Th>
+                   <Th>数量</Th>
+                   <Th>违规占比</Th>
+                   <Th>风险水位</Th>
                  </tr>
                </thead>
                <tbody>
-                  <tr><Td>送审量级</Td><Td>{report.totalRows}</Td></tr>
-                  <tr><Td>机审拒绝</Td><Td>{report.machineRejectCount}</Td></tr>
-                  <tr><Td>策略召回量级（送人审）</Td><Td>{report.recallCount}</Td></tr>
-                  <tr><Td>策略总命中率</Td><Td>{formatPercent(report.recallCount, report.totalRows, 2)}%</Td></tr>
-                  <tr><Td>人审判定违规量级</Td><Td>{report.humanViolationCount}</Td></tr>
-                  <tr><Td>策略总精确率</Td><Td>{formatPercent(report.humanViolationCount, report.recallCount, 2)}%</Td></tr>
-                  <tr style={{ background: '#fff1f2' }}><Td><strong>黑样本总数</strong></Td><Td><strong>{report.blackSampleTotal}</strong></Td></tr>
-                  <tr style={{ background: '#fff1f2' }}><Td><strong>大盘风险水位</strong></Td><Td><strong>{formatPercent(report.blackSampleTotal, report.totalRows, 2)}%</strong></Td></tr>
-               </tbody>
-            </Table>
-
-            <SectionTitle title="二、策略情况" />
-            <div style={{ overflowX: 'auto' }}>
-              <Table>
-                <thead>
-                  <tr style={{ background: '#f3f4f6' }}>
-                    <Th>策略名称</Th>
-                    <Th>命中数</Th>
-                    <Th>命中率</Th>
-                    <Th>送人审</Th>
-                    <Th>违规数</Th>
-                    <Th>精确率</Th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {report.strategyList.map((s, i) => (
+                 {report.tagList.map((t, i) => (
                     <tr key={i}>
-                      <Td>{s.name}</Td>
-                      <Td>{s.hitCount}</Td>
-                      <Td>{formatPercent(s.hitCount, report.totalRows, 4)}%</Td>
-                      <Td>{s.humanReviewCount} <span style={{fontSize:'0.85em', color:'#6b7280'}}>(待审：{s.pendingCount})</span></Td>
-                      <Td>{s.violationCount}</Td>
-                      <Td>{formatPercent(s.violationCount, s.humanReviewCount, 2)}%</Td>
+                      <Td>{t.name}</Td>
+                      <Td>{t.count}</Td>
+                      <Td>{formatPercent(t.count, report.aggHumanViolationCount, 4)}%</Td>
+                      <Td>{formatPercent(t.count, report.aggTotalRows, 4)}%</Td>
                     </tr>
-                  ))}
-                </tbody>
-              </Table>
-            </div>
-
-            <SectionTitle title="三、违规标签分布 (Top 15)" />
-            <div style={{ marginBottom: '10px', fontSize: '13px', color: '#374151' }}>
-                <div>• 人审违规数量：{report.humanViolationCount}</div>
-                <div>• 机审拒绝+人审违规数量：{report.blackSampleTotal}</div>
-            </div>
-            <Table>
-              <thead>
-                <tr style={{ background: '#f3f4f6' }}>
-                  <Th>标签名称</Th>
-                  <Th>数量</Th>
-                  <Th>违规占比</Th>
-                  <Th>风险水位</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {report.tagList.map((t, i) => (
-                   <tr key={i}>
-                     <Td>{t.name}</Td>
-                     <Td>{t.count}</Td>
-                     <Td>{formatPercent(t.count, report.humanViolationCount, 4)}%</Td>
-                     <Td>{formatPercent(t.count, report.totalRows, 4)}%</Td>
-                   </tr>
-                ))}
-                 <tr style={{ fontWeight: 'bold', background: '#f9fafb' }}>
-                    <Td>汇总</Td>
-                    <Td>{report.totalTagCount}</Td>
-                    <Td>100.00%</Td>
-                    <Td>{report.tagList.reduce((acc, t) => acc + (t.count / report.totalRows) * 100, 0).toFixed(4)}%</Td>
-                 </tr>
-              </tbody>
-            </Table>
+                 ))}
+                  <tr style={{ fontWeight: 'bold', background: '#f9fafb' }}>
+                     <Td>汇总</Td>
+                     <Td>{report.totalTagCount}</Td>
+                     <Td>100.00%</Td>
+                     <Td>{report.tagList.reduce((acc, t) => acc + (t.count / report.aggTotalRows) * 100, 0).toFixed(4)}%</Td>
+                  </tr>
+               </tbody>
+             </Table>
 
           </div>
-
-          {/* Markdown Output Area */}
-          <div style={{ display: 'flex', flexDirection: 'column', height: 'fit-content', position: 'sticky', top: '20px' }}>
-            <div style={{ background: '#1e293b', padding: '20px', borderRadius: '12px 12px 0 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h2 style={{ fontSize: '16px', color: '#f1f5f9', margin: 0 }}>📝 Markdown 源码</h2>
-              <button 
-                onClick={handleCopy}
-                style={{ 
-                  background: copied ? '#10b981' : '#3b82f6', 
-                  border: 'none', 
-                  color: 'white', 
-                  padding: '6px 12px', 
-                  borderRadius: '6px', 
-                  cursor: 'pointer', 
-                  fontSize: '13px',
-                  fontWeight: '500',
-                  transition: 'all 0.2s',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px'
-                }}
-              >
-                {copied ? '✓ 已复制' : '复制内容'}
-              </button>
-            </div>
-            <textarea 
-              readOnly 
-              value={markdownOutput} 
-              style={{ 
-                flex: 1, 
-                minHeight: '600px',
-                background: '#0f172a', 
-                color: '#e2e8f0', 
-                border: 'none',
-                borderRadius: '0 0 12px 12px', 
-                padding: '16px', 
-                fontFamily: '"Menlo", "Monaco", "Courier New", monospace', 
-                fontSize: '13px',
-                resize: 'vertical',
-                lineHeight: '1.6'
-              }}
-            />
-          </div>
-
         </div>
       )}
     </div>
   );
 };
 
-// --- Styled Components (Simple) ---
+// --- Styled Components ---
 
 const SectionTitle = ({title}: {title: string}) => (
   <h3 style={{ fontSize: '15px', color: '#4b5563', marginTop: '24px', marginBottom: '12px', fontWeight: '600' }}>{title}</h3>
 );
 
 const Table = ({children}: {children: React.ReactNode}) => (
-  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', border: '1px solid #e5e7eb' }}>
+  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', border: '1px solid #e5e7eb', whiteSpace: 'nowrap' }}>
     {children}
   </table>
 );
 
 const Th = ({children}: {children: React.ReactNode}) => (
-  <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: '600', color: '#374151', borderBottom: '1px solid #e5e7eb' }}>
+  <th style={{ padding: '10px 12px', textAlign: 'center', fontWeight: '600', color: '#374151', borderBottom: '1px solid #e5e7eb', background: '#f9fafb' }}>
     {children}
   </th>
 );
 
 const Td = ({children}: {children: React.ReactNode}) => (
-  <td style={{ padding: '10px 12px', borderBottom: '1px solid #f3f4f6', color: '#1f2937' }}>
+  <td style={{ padding: '10px 12px', borderBottom: '1px solid #f3f4f6', color: '#1f2937', textAlign: 'center' }}>
     {children}
   </td>
 );
