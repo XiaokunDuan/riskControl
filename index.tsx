@@ -73,10 +73,11 @@ const formatDecimal = (val: number, decimals: number = 2): string => {
   return val.toFixed(decimals);
 };
 
+// Updated regex to support more date formats (-, /, ., Chinese)
 const extractDate = (dateStr: string): string | null => {
   if (!dateStr) return null;
-  // Match YYYY/MM/DD or YYYY-MM-DD
-  const match = dateStr.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  // Match YYYY/MM/DD, YYYY-MM-DD, YYYY.MM.DD, YYYY年MM月DD日
+  const match = dateStr.match(/(\d{4})[\.\-\/年](\d{1,2})[\.\-\/月](\d{1,2})/);
   if (match) {
     const year = match[1];
     const month = match[2].padStart(2, '0');
@@ -89,7 +90,8 @@ const extractDate = (dateStr: string): string | null => {
 const formatDateWithWeekday = (dateStr: string): string => {
   if (!dateStr) return '';
   const [y, m, d] = dateStr.split('-').map(Number);
-  // Create date object using local time components to avoid timezone shifts
+  // Create date object using local time components
+  // Note: Month is 0-indexed in Date constructor (0=Jan, 11=Dec)
   const date = new Date(y, m - 1, d);
   const weekday = WEEKDAYS[date.getDay()];
   return `${m}.${d} ${weekday}`;
@@ -256,7 +258,23 @@ const App = () => {
 
     // --- Mode 1: Weekly/Overall ---
     if (selectedDate === WEEKLY_KEY) {
-      const dates = availableDates; // Already sorted ASC
+      let dates = availableDates; // Already sorted ASC
+
+      // --- NOISE FILTERING LOGIC ---
+      // Determine if there are outlier dates with extremely low volume (e.g., stray data from previous day)
+      // Heuristic: If max daily volume > 100, filter out any day with < 10 rows (or < 1% of max).
+      if (dates.length > 1) {
+          const dailyCounts = dates.map(d => {
+              return rawData.filter(r => extractDate(r['入审时间']) === d).length;
+          });
+          const maxVolume = Math.max(...dailyCounts);
+          
+          if (maxVolume > 100) {
+             const threshold = Math.max(5, maxVolume * 0.005); // 0.5% threshold or 5 rows
+             dates = dates.filter((d, i) => dailyCounts[i] > threshold);
+          }
+      }
+      
       const dailyStatsMap: Record<string, BasicStats> = {};
       
       // Accumulators for aggregation
@@ -398,7 +416,7 @@ const App = () => {
 
     let md = `### 一、基本统计分析工作\n`;
     md += `**[${report.dateLabel}] 大盘情况**\n`;
-    md += `包括但不限于送审量级、策略召回量级、违规量级、大盘风险水位（违规量级/送审量级）等\n\n`;
+    md += `*包括但不限于送审量级、策略召回量级、违规量级、大盘风险水位（违规量级/送审量级）等*\n\n`;
 
     // --- Section 1: Matrix or Single ---
     if (report.mode === 'WEEKLY' && report.dates && report.dailyStatsMap && report.totalStats && report.avgStats) {
@@ -618,6 +636,7 @@ const App = () => {
 
              {/* 1. General Stats Table (Matrix or Single) */}
              <SectionTitle title="一、大盘情况" />
+             <SectionDesc text="包括但不限于送审量级、策略召回量级、违规量级、大盘风险水位（违规量级/送审量级）等" />
              {report.mode === 'WEEKLY' && report.dates && report.totalStats ? (
                 <div style={{ overflowX: 'auto' }}>
                   <Table>
@@ -707,6 +726,7 @@ const App = () => {
 
              {/* 2. Strategies */}
              <SectionTitle title="二、策略情况" />
+             <SectionDesc text="(策略召回量级/送审量级)、策略精确率（违规量级/策略召回量级）" />
              <div style={{ overflowX: 'auto' }}>
                <Table>
                  <thead>
@@ -735,10 +755,11 @@ const App = () => {
              </div>
 
              {/* 3. Tags */}
-             <SectionTitle title="三、违规标签分布 (Top 35)" />
+             <SectionTitle title="三、大盘风险分布" />
+             <SectionDesc text="(by标签统计量级、违规标签占比：违规标签a/总违规量级、违规标签风险水位：违规标签a/送审量级)" />
              <div style={{ marginBottom: '10px', fontSize: '13px', color: '#374151' }}>
                 <div>• 人审违规数量：{report.aggHumanViolationCount}</div>
-                <div>• 机审拒绝+人审违规数量：{report.mode === 'WEEKLY' ? report.totalStats?.blackSampleTotal : report.singleStats?.blackSampleTotal}</div>
+                <div>• 机审拒绝+人审违规数量 (实际上是策略召回+人审违规)：{report.mode === 'WEEKLY' ? report.totalStats?.blackSampleTotal : report.singleStats?.blackSampleTotal}</div>
              </div>
              <Table>
                <thead>
@@ -778,6 +799,10 @@ const App = () => {
 
 const SectionTitle = ({title}: {title: string}) => (
   <h3 style={{ fontSize: '15px', color: '#4b5563', marginTop: '24px', marginBottom: '12px', fontWeight: '600' }}>{title}</h3>
+);
+
+const SectionDesc = ({text}: {text: string}) => (
+  <p style={{ fontSize: '13px', color: '#6b7280', marginTop: '-8px', marginBottom: '16px', fontStyle: 'italic' }}>{text}</p>
 );
 
 const Table = ({children}: {children: React.ReactNode}) => (
