@@ -56,11 +56,12 @@ const STRATEGY_MAPPING: Record<string, string> = {
   'service_sync_word': '业务线词表策略',
   'qr_code_detect': '二维码图片识别模型',
   'sensitive_img_model': '敏感图片模型',
-  'img_ocr_strategy': '图片ocr策略'
+  'img_ocr_strategy': '图片ocr策略',
+  'service_variant_word_check': '习彭变体词表' 
 };
 
 const WEEKLY_KEY = 'ALL_WEEKLY_REPORT';
-const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+// const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']; // 不需要了
 
 // --- Helper Functions ---
 
@@ -87,17 +88,19 @@ const extractDate = (dateStr: string): string | null => {
   return null;
 };
 
-const formatDateWithWeekday = (dateStr: string): string => {
+// 修改点：只返回 MM.DD 格式，去掉星期
+const formatDateSimple = (dateStr: string): string => {
   if (!dateStr) return '';
   const [y, m, d] = dateStr.split('-').map(Number);
-  // Create date object using local time components
-  // Note: Month is 0-indexed in Date constructor (0=Jan, 11=Dec)
-  const date = new Date(y, m - 1, d);
-  const weekday = WEEKDAYS[date.getDay()];
-  return `${m}.${d} ${weekday}`;
+  // 直接返回 月.日
+  return `${m}.${d}`;
 };
 
 // --- Analysis Core ---
+
+// --- Analysis Core (优化版) ---
+
+// --- Analysis Core (Regex 增强版) ---
 
 const analyzeRows = (rows: CsvRow[]) => {
   let totalRows = rows.length;
@@ -108,69 +111,93 @@ const analyzeRows = (rows: CsvRow[]) => {
   const strategyMap = new Map<string, StrategyStats>();
   const tagMap = new Map<string, number>();
 
+  // 定义需要合并的标签映射（解决“虚假宣传”数不上的问题）
+  // 如果您希望程序自动把细分标签合并成大类，可以在这里配置
+  const TAG_MERGE_MAPPING: Record<string, string> = {
+    //'虚假宣传荣誉信息': '虚假宣传',
+    //'虚假宣传商品专利信息': '虚假宣传',
+    // '虚构被比较价格': '价格虚假', // 如果系统把这个也算进价格虚假，可以解开注释
+  };
+
   rows.forEach(row => {
-    // 1. Basic Stats
+    // 1. 基础指标统计
     const isSyncReject = row['同步机审状态']?.trim() === '拒绝';
     const isAsyncReject = row['异步机审状态']?.trim() === '拒绝';
     const isMachineReject = isSyncReject || isAsyncReject;
     if (isMachineReject) machineRejectCount++;
 
     const humanStatus = row['人审状态']?.trim();
-    const isHumanSent = !!humanStatus; // Not empty -> Sent to human (Recall)
+    const isHumanSent = !!humanStatus; 
     const isHumanViolation = humanStatus === '拒绝';
     const isHumanPending = humanStatus === '待审';
 
     if (isHumanSent) recallCount++;
     if (isHumanViolation) humanViolationCount++;
 
-    // 2. Strategy Stats
+    // 2. 策略统计 (保持不变)
     let rawStrategyValue = row['同步机审命中策略']?.trim();
     if (!rawStrategyValue) {
       rawStrategyValue = row['异步机审命中策略']?.trim();
     }
 
     if (rawStrategyValue) {
-      const splitName = rawStrategyValue.split('&&')[0].trim();
-      const strategyName = STRATEGY_MAPPING[splitName] || splitName;
+      const allStrategies = rawStrategyValue.split('&&');
+      allStrategies.forEach(rawName => {
+          const cleanName = rawName.trim();
+          if (!cleanName) return;
+          const strategyName = STRATEGY_MAPPING[cleanName] || cleanName;
 
-      if (!strategyMap.has(strategyName)) {
-        strategyMap.set(strategyName, {
-          name: strategyName,
-          hitCount: 0,
-          humanReviewCount: 0,
-          pendingCount: 0,
-          violationCount: 0
-        });
-      }
-
-      const stats = strategyMap.get(strategyName)!;
-      stats.hitCount++;
-      if (isHumanSent) stats.humanReviewCount++;
-      if (isHumanPending) stats.pendingCount++;
-      if (isHumanViolation) stats.violationCount++;
+          if (!strategyMap.has(strategyName)) {
+            strategyMap.set(strategyName, {
+              name: strategyName, hitCount: 0, humanReviewCount: 0, pendingCount: 0, violationCount: 0
+            });
+          }
+          const stats = strategyMap.get(strategyName)!;
+          stats.hitCount++;
+          if (isHumanSent) stats.humanReviewCount++;
+          if (isHumanPending) stats.pendingCount++;
+          if (isHumanViolation) stats.violationCount++;
+      });
     }
 
-    // 3. Tag Stats (Only for violations)
+    // 3. 标签统计 (👉 核心修改：使用正则分割 + 映射归类)
     if (isHumanViolation) {
       const rawTags = String(row['人审标签'] || '');
-      const tokens = rawTags.split('&&');
-      tokens.forEach(token => {
-        const tag = token.trim();
-        const isInvalid = !tag ||
-          tag === '通过' ||
-          tag === '拒绝' ||
-          tag === '待审' ||
-          tag === '送审';
+      
+      // 【正则切割】
+      // 含义：同时支持 &&、$$、斜杠/、加号+、中英文逗号、空格 作为分隔符
+      // 这样能解决 "标签A/标签B" 或 "标签A$$标签B" 这种不规范格式
+      const tokens = rawTags.split(/&&|\$\$|\+|[,\s，]+/);
+
+      // 使用 Set 去重（防止一行里写了两次同一个标签，导致计数虚高）
+      const uniqueTagsInRow = new Set<string>();
+
+      tokens.forEach(t => {
+        let tag = t.trim();
+        
+        // 过滤干扰词
+        const isInvalid = !tag || 
+          ['通过', '拒绝', '待审', '送审', 'null', '无', '内容涉及', '请修改后重试'].includes(tag);
 
         if (!isInvalid) {
-          tagMap.set(tag, (tagMap.get(tag) || 0) + 1);
+          // 【归类映射】(解决 37 vs 6 的问题)
+          // 如果这个标签在映射表里（比如是“虚假宣传荣誉信息”），就把它变成“虚假宣传”
+          if (TAG_MERGE_MAPPING[tag]) {
+            tag = TAG_MERGE_MAPPING[tag];
+          }
+          
+          uniqueTagsInRow.add(tag);
         }
+      });
+
+      // 统计
+      uniqueTagsInRow.forEach(tag => {
+        tagMap.set(tag, (tagMap.get(tag) || 0) + 1);
       });
     }
   });
 
-  // 4. Black Sample Logic: Recall + Violation
-  const blackSampleTotal = recallCount + humanViolationCount;
+  const blackSampleTotal = machineRejectCount + humanViolationCount;
 
   return {
     totalRows,
@@ -182,6 +209,7 @@ const analyzeRows = (rows: CsvRow[]) => {
     tagMap
   };
 };
+
 
 
 // --- Main Application ---
@@ -228,7 +256,7 @@ const App = () => {
         }
 
         const firstRow = data[0];
-        if (!firstRow['入审时间'] && !firstRow['同步机审状态']) {
+        if (!firstRow['异步机审入审时间'] && !firstRow['同步机审状态']) {
           setError("警告：关键列未找到，请检查 CSV 编码是否正确 (建议尝试 GBK)");
         }
 
@@ -236,7 +264,7 @@ const App = () => {
 
         const dates = new Set<string>();
         data.forEach(row => {
-          const d = extractDate(row['入审时间']);
+          const d = extractDate(row['异步机审入审时间']);
           if (d) dates.add(d);
         });
 
@@ -261,16 +289,14 @@ const App = () => {
       let dates = availableDates; // Already sorted ASC
 
       // --- NOISE FILTERING LOGIC ---
-      // Determine if there are outlier dates with extremely low volume (e.g., stray data from previous day)
-      // Heuristic: If max daily volume > 100, filter out any day with < 10 rows (or < 1% of max).
       if (dates.length > 1) {
           const dailyCounts = dates.map(d => {
-              return rawData.filter(r => extractDate(r['入审时间']) === d).length;
+              return rawData.filter(r => extractDate(r['异步机审入审时间']) === d).length;
           });
           const maxVolume = Math.max(...dailyCounts);
           
           if (maxVolume > 100) {
-             const threshold = Math.max(5, maxVolume * 0.005); // 0.5% threshold or 5 rows
+             const threshold = Math.max(5, maxVolume * 0.005);
              dates = dates.filter((d, i) => dailyCounts[i] > threshold);
           }
       }
@@ -293,7 +319,7 @@ const App = () => {
       const aggTagMap = new Map<string, number>();
 
       dates.forEach(d => {
-        const dayRows = rawData.filter(r => extractDate(r['入审时间']) === d);
+        const dayRows = rawData.filter(r => extractDate(r['异步机审入审时间']) === d);
         const stats = analyzeRows(dayRows);
         dailyStatsMap[d] = stats;
 
@@ -305,7 +331,6 @@ const App = () => {
         aggBlackSample += stats.blackSampleTotal;
 
         // Sum Rates (for simple average calc)
-        // Rate = (num / den) * 100
         const recallRate = stats.totalRows > 0 ? (stats.recallCount / stats.totalRows) * 100 : 0;
         const precision = stats.recallCount > 0 ? (stats.humanViolationCount / stats.recallCount) * 100 : 0;
         const risk = stats.totalRows > 0 ? (stats.blackSampleTotal / stats.totalRows) * 100 : 0;
@@ -342,16 +367,15 @@ const App = () => {
         blackSampleTotal: aggBlackSample
       };
 
-      // Prepare Average Stats (Simple Average over days)
+      // Prepare Average Stats
       const dayCount = dates.length || 1;
       const avgStats = {
         totalRows: formatDecimal(aggTotalRows / dayCount, 2),
-        machineRejectCount: formatDecimal(aggMachineReject / dayCount, 3), // Example had 3 decimals
+        machineRejectCount: formatDecimal(aggMachineReject / dayCount, 3),
         recallCount: formatDecimal(aggRecall / dayCount, 2),
         humanViolationCount: formatDecimal(aggHumanViolation / dayCount, 2),
-        blackSampleTotal: formatDecimal(aggBlackSample / dayCount, 0), // Usually int, example 600
+        blackSampleTotal: formatDecimal(aggBlackSample / dayCount, 0),
         
-        // Rate Averages
         recallRate: formatDecimal(sumRecallRate / dayCount, 2) + '%',
         precision: formatDecimal(sumPrecision / dayCount, 2) + '%',
         riskLevel: formatDecimal(sumRiskLevel / dayCount, 2) + '%'
@@ -383,7 +407,7 @@ const App = () => {
     } 
     // --- Mode 2: Single Day ---
     else {
-      const dayRows = rawData.filter(r => extractDate(r['入审时间']) === selectedDate);
+      const dayRows = rawData.filter(r => extractDate(r['异步机审入审时间']) === selectedDate);
       const stats = analyzeRows(dayRows);
       
       const strategyList = Array.from(stats.strategyMap.values()).sort((a, b) => b.hitCount - a.hitCount);
@@ -414,6 +438,10 @@ const App = () => {
   const generateMarkdown = () => {
     if (!report) return '';
 
+    // Calculate real black sample for Section 3 (Machine + Human)
+    const stats = report.mode === 'WEEKLY' ? report.totalStats : report.singleStats;
+    const realBlackSample = (stats?.machineRejectCount || 0) + (stats?.humanViolationCount || 0);
+
     let md = `### 一、基本统计分析工作\n`;
     md += `**[${report.dateLabel}] 大盘情况**\n`;
     md += `*包括但不限于送审量级、策略召回量级、违规量级、大盘风险水位（违规量级/送审量级）等*\n\n`;
@@ -421,8 +449,10 @@ const App = () => {
     // --- Section 1: Matrix or Single ---
     if (report.mode === 'WEEKLY' && report.dates && report.dailyStatsMap && report.totalStats && report.avgStats) {
        // Matrix Header
-       // Update: Include weekday in header
-       const dateHeaders = report.dates.map(d => formatDateWithWeekday(d)).join(' | ');
+       // -------------------------------------------------------
+       // 修改点：这里调用 formatDateSimple 而不是 formatDateWithWeekday
+       const dateHeaders = report.dates.map(d => formatDateSimple(d)).join(' | ');
+       // -------------------------------------------------------
        md += `| 指标 | ${dateHeaders} | 总计 | 7天日均 |\n`;
        md += `| :--- | ${report.dates.map(() => ':---').join(' | ')} | :--- | :--- |\n`;
        
@@ -442,13 +472,11 @@ const App = () => {
          // Total
          const totalVal = report.totalStats![key];
          if (isPercent && denomKey) {
-             // Total Rate = Total Num / Total Denom
              rowStr += ` ${formatPercent(totalVal, report.totalStats![denomKey], 2)}% |`;
          } else {
              rowStr += ` ${totalVal} |`;
          }
          // Avg
-         // Map keys to avgStats keys
          let avgVal = '';
          if (label === '送审量级') avgVal = report.avgStats!.totalRows;
          else if (label === '机审拒绝') avgVal = report.avgStats!.machineRejectCount;
@@ -474,7 +502,6 @@ const App = () => {
        md += '\n';
 
     } else if (report.mode === 'SINGLE' && report.singleStats) {
-       // Original Single Column View
        const s = report.singleStats;
        const recallRate = formatPercent(s.recallCount, s.totalRows, 2);
        const strategyPrecision = formatPercent(s.humanViolationCount, s.recallCount, 2);
@@ -508,11 +535,7 @@ const App = () => {
     md += `### 三、大盘风险分布\n`;
     md += `*(by标签统计量级、违规标签占比：违规标签a/总违规量级、违规标签风险水位：违规标签a/送审量级)*\n`;
     md += `*   人审违规数量：${report.aggHumanViolationCount}\n`;
-    // For Weekly, this sums up black samples. For Single, it's black samples.
-    // Logic: Black Sample = Recall + Human Violation. 
-    // report.totalStats?.blackSampleTotal or report.singleStats?.blackSampleTotal
-    const blackTotal = report.mode === 'WEEKLY' ? report.totalStats!.blackSampleTotal : report.singleStats!.blackSampleTotal;
-    md += `*   机审拒绝+人审违规数量 (实际上是策略召回+人审违规)：${blackTotal}\n\n`;
+    md += `*   机审拒绝+人审违规数量：${realBlackSample}\n\n`;
     
     md += `| 人审标签 | 数量 | 违规标签占比 | 风险水位 |\n`;
     md += `| :--- | :--- | :--- | :--- |\n`;
@@ -643,8 +666,8 @@ const App = () => {
                     <thead>
                       <tr>
                          <Th>指标</Th>
-                         {/* Update: Show formatted date with weekday */}
-                         {report.dates.map(d => <Th key={d}>{formatDateWithWeekday(d)}</Th>)}
+                         {/* Update: Show formatted date simple */}
+                         {report.dates.map(d => <Th key={d}>{formatDateSimple(d)}</Th>)}
                          <Th>总计</Th>
                          <Th>7天日均</Th>
                       </tr>
@@ -759,7 +782,7 @@ const App = () => {
              <SectionDesc text="(by标签统计量级、违规标签占比：违规标签a/总违规量级、违规标签风险水位：违规标签a/送审量级)" />
              <div style={{ marginBottom: '10px', fontSize: '13px', color: '#374151' }}>
                 <div>• 人审违规数量：{report.aggHumanViolationCount}</div>
-                <div>• 机审拒绝+人审违规数量 (实际上是策略召回+人审违规)：{report.mode === 'WEEKLY' ? report.totalStats?.blackSampleTotal : report.singleStats?.blackSampleTotal}</div>
+                <div>• 机审拒绝+人审违规数量：{(report.mode === 'WEEKLY' ? report.totalStats?.machineRejectCount : report.singleStats?.machineRejectCount) + (report.mode === 'WEEKLY' ? report.totalStats?.humanViolationCount : report.singleStats?.humanViolationCount)}</div>
              </div>
              <Table>
                <thead>
