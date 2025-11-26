@@ -51,13 +51,20 @@ interface ReportData {
 // --- Constants & Mappings ---
 
 const STRATEGY_MAPPING: Record<string, string> = {
+  // 原有策略
   'huiboxing_wenxin_model': 'huiboxing文心大模型',
   'service_digital_human_check': '数字人物料机审',
   'service_sync_word': '业务线词表策略',
   'qr_code_detect': '二维码图片识别模型',
   'sensitive_img_model': '敏感图片模型',
   'img_ocr_strategy': '图片ocr策略',
-  'service_variant_word_check': '习彭变体词表' 
+  'service_variant_word_check': '习彭变体词表',
+
+  // === 新增策略 ===
+  'duxiaodian_review': '度小店审核',
+  'service_short_text_check': '短文本机审',
+  'sensitive_hardface': '敏感人脸模型',
+  'service_word_3s_check': '3S敏感词策略'
 };
 
 const WEEKLY_KEY = 'ALL_WEEKLY_REPORT';
